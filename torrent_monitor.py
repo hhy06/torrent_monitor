@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WSJ 种子监控 / qBittorrent 推送工具
-
+torrent_monitor V2.0
+protocol_version: 2.0
+单文件：支持 CLI / PyQt6‑GUI
 流程：
-  1. 读取 YAML 配置，抓取配置中的种子列表页（默认 TPB 用户页）。
-  2. 解析每行种子：标题、分类、发布时间、大小、做种数、下载数、上传者、magnet。
-  3. 按「标题包含关键字 + 大小上限 + 发布日期在最近 N 天」过滤。
-  4. 把命中的种子全部字段写入 SQLite（可重复运行，按 info_hash 去重）。
-  5. 把「新增的」或「之前推送失败」的 magnet 通过 qBittorrent Web UI API
-     提交给局域网中的 qbittorrent-nox，并把推送结果写回数据库。
-     后续下载、文件管理不在本脚本职责内。
+1.加载配置校验protocol_version=2.0
+2.抓取全部search‑terms，auto/manual全部过滤入库，status=pending
+3.GUI模式：逐个弹出manual组QDialog窗口，收集用户勾选种子info_hash集合（暂不推送）
+4.合并【auto全部命中】+【GUI手动勾选】作为待推送总列表，统一批量提交qBittorrent
+5.统一写数据库推送状态与日志
+CLI模式：mode=manual的搜索项打印警告，不做人工选择。
 
+依赖：
+pip install pyyaml requests beautifulsoup4 pyqt6
 用法：
-  python torrent_monitor.py --config config.yaml
-  python torrent_monitor.py --dry-run                 # 只抓取入库，不推送
-  python torrent_monitor.py --html-file sample.html   # 用本地 HTML 调试解析
-
-依赖：pip install requests beautifulsoup4 PyYAML
+# CLI命令行模式
+python torrent_monitor.py --config config.yaml
+# GUI图形界面模式
+python torrent_monitor.py --gui --config config.yaml
+# dry‑run只抓取入库，不推送
+python torrent_monitor.py --gui --dry-run --config config.yaml
 """
-
 from __future__ import annotations
-
 import argparse
 import hashlib
 import logging
@@ -31,22 +32,30 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
+
+try:
+    from PyQt6.QtWidgets import (QApplication, QDialog, QTableWidget, QTableWidgetItem,
+                                 QPushButton, QVBoxLayout, QCheckBox, QHeaderView,
+                                 QMessageBox)
+    from PyQt6.QtCore import Qt
+    HAVE_GUI = True
+except ImportError:
+    HAVE_GUI = False
 
 import requests
 import yaml
 from bs4 import BeautifulSoup
 
-LOG = logging.getLogger("torrent_monitor")
+SCRIPT_VERSION = "2.0"
+REQUIRED_PROTOCOL_VERSION = "2.0"
 
+LOG = logging.getLogger("torrent_monitor")
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
-
-# TPB 服务器时间与本机可能有微小差异，允许 12 小时的"未来"容差
 FUTURE_TOLERANCE = timedelta(hours=12)
-
 SIZE_RE = re.compile(r"([\d.,]+)\s*(KiB|MiB|GiB|TiB|KB|MB|GB|TB|B)(?!\w)", re.I)
 RE_TODAY = re.compile(r"^Today\s+(\d{1,2}):(\d{2})", re.I)
 RE_YDAY = re.compile(r"^Y-day\s+(\d{1,2}):(\d{2})", re.I)
@@ -66,29 +75,31 @@ SIZE_FACTORS = {
     "TIB": 1024 ** 4,
 }
 
-
 # ---------------------------------------------------------------------------
 # 通用工具
 # ---------------------------------------------------------------------------
 def now_iso() -> str:
-    """当前本地时间，ISO 格式（秒级）。"""
     return datetime.now().replace(microsecond=0).isoformat()
 
-
 def resolve_path(value: str, base_dir: Path) -> Path:
-    """相对路径按配置文件所在目录解析。"""
     p = Path(value).expanduser()
     return p if p.is_absolute() else (base_dir / p).resolve()
-
 
 def load_config(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     if not isinstance(cfg, dict):
         raise ValueError("配置文件顶层必须是映射（key: value）结构")
+
+    proto_ver = cfg.get("protocol_version")
+    if proto_ver != REQUIRED_PROTOCOL_VERSION:
+        raise ValueError(
+            f"配置协议版本不匹配！脚本需要 protocol_version={REQUIRED_PROTOCOL_VERSION}，"
+            f"当前配置为 {proto_ver}，请更新 config.yaml"
+        )
+
     for section in ("global", "database", "qbittorrent", "logging"):
         cfg.setdefault(section, {})
-
     terms = cfg.get("search-terms")
     if not isinstance(terms, list) or not terms:
         raise ValueError("配置缺少非空列表 'search-terms'")
@@ -97,11 +108,10 @@ def load_config(path: Path) -> Dict[str, Any]:
             raise ValueError(f"search-terms[{i}] 必须是映射结构")
         if not term.get("url"):
             raise ValueError(f"search-terms[{i}] 缺少 'url'")
+        term.setdefault("mode", "auto")
     return cfg
 
-
 def term_filters(term: Dict[str, Any]) -> Dict[str, Any]:
-    """把单个 search-term 归一化成 passes_filters 使用的 filters。"""
     size_cfg = term.get("size") or {}
     max_mb = term.get("max_size_mb", size_cfg.get("max_mb"))
     return {
@@ -110,18 +120,15 @@ def term_filters(term: Dict[str, Any]) -> Dict[str, Any]:
         "max_age_days": term.get("max_age_days"),
     }
 
-
 def setup_logging(cfg: Dict[str, Any], base_dir: Path) -> None:
     level_name = str(cfg.get("level", "INFO")).upper()
     level = getattr(logging, level_name, logging.INFO)
     LOG.setLevel(level)
     LOG.handlers.clear()
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
-
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     LOG.addHandler(sh)
-
     log_file = cfg.get("file")
     if log_file:
         p = resolve_path(str(log_file), base_dir)
@@ -130,17 +137,14 @@ def setup_logging(cfg: Dict[str, Any], base_dir: Path) -> None:
         fh.setFormatter(fmt)
         LOG.addHandler(fh)
 
-
 # ---------------------------------------------------------------------------
 # 解析：大小 / 日期 / magnet
 # ---------------------------------------------------------------------------
 def parse_size(text: str) -> Optional[int]:
-    """把 '34.03 MiB' / '1.74 GiB' 之类的文本换算成字节数。"""
     m = SIZE_RE.search(text.replace("\xa0", " ").strip())
     if not m:
         return None
     num_str = m.group(1)
-    # 兼容 '1,234.56'（千分位逗号）和 '34,03'（欧洲小数点逗号）
     if "." in num_str and "," in num_str:
         num_str = num_str.replace(",", "")
     elif "," in num_str:
@@ -153,21 +157,16 @@ def parse_size(text: str) -> Optional[int]:
     factor = SIZE_FACTORS[m.group(2).upper()]
     return int(value * factor)
 
-
 def parse_tpb_date(text: str, now: datetime) -> Optional[datetime]:
-    """解析 TPB 的三种日期写法：Today HH:MM / Y-day HH:MM / MM-DD HH:MM。"""
     s = text.replace("\xa0", " ").strip()
-
     m = RE_TODAY.match(s)
     if m:
         return now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
-
     m = RE_YDAY.match(s)
     if m:
         return (now - timedelta(days=1)).replace(
             hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0
         )
-
     m = RE_MDHM.match(s)
     if m:
         month, day, hour, minute = map(int, m.groups())
@@ -175,14 +174,12 @@ def parse_tpb_date(text: str, now: datetime) -> Optional[datetime]:
             d = datetime(now.year, month, day, hour, minute)
         except ValueError:
             return None
-        # 跨年的情况：若算出来的时间明显在未来，则回退一年
         if d > now + timedelta(days=1):
             try:
                 d = d.replace(year=now.year - 1)
             except ValueError:
                 return None
         return d
-
     m = RE_MD.match(s)
     if m:
         month, day = map(int, m.groups())
@@ -193,7 +190,6 @@ def parse_tpb_date(text: str, now: datetime) -> Optional[datetime]:
         if d > now + timedelta(days=1):
             d = d.replace(year=now.year - 1)
         return d
-
     m = RE_FULL.match(s)
     if m:
         year, month, day = map(int, m.groups())
@@ -201,17 +197,13 @@ def parse_tpb_date(text: str, now: datetime) -> Optional[datetime]:
             return datetime(year, month, day)
         except ValueError:
             return None
-
     return None
 
-
 def info_hash_from_magnet(magnet: str) -> str:
-    """优先使用 btih；没有 btih 时用 magnet 本身的 sha1 作为稳定主键。"""
     m = re.search(r"btih:([0-9a-fA-F]{40}|[A-Za-z2-7]{32})", magnet)
     if m:
         return m.group(1).lower()
     return "sha1:" + hashlib.sha1(magnet.encode("utf-8")).hexdigest()
-
 
 # ---------------------------------------------------------------------------
 # 抓取 + 页面解析
@@ -223,7 +215,6 @@ def fetch_html(url: str, cfg: Dict[str, Any]) -> str:
     last_error: Optional[Exception] = None
     session = requests.Session()
     session.trust_env = bool(cfg.get("trust_env", True))
-
     for attempt in range(retries + 1):
         try:
             LOG.info("抓取页面 %s（第 %d/%d 次）", url, attempt + 1, retries + 1)
@@ -231,24 +222,18 @@ def fetch_html(url: str, cfg: Dict[str, Any]) -> str:
             resp.raise_for_status()
             resp.encoding = resp.apparent_encoding or "utf-8"
             return resp.text
-        except Exception as exc:  # noqa: BLE001 - 网络层异常类型较多，统一处理
+        except Exception as exc:
             last_error = exc
             LOG.warning("抓取失败：%s", exc)
             if attempt < retries:
                 time.sleep(1.5 * (attempt + 1))
-
     raise RuntimeError(f"抓取页面失败（已重试 {retries} 次）：{last_error}")
 
-
 def parse_page(html: str, now: datetime) -> List[Dict[str, Any]]:
-    """从 TPB 列表页的 <tr> 中提取种子信息。"""
     soup = BeautifulSoup(html, "html.parser")
     results: List[Dict[str, Any]] = []
-
     for tr in soup.find_all("tr"):
         links = [a for a in tr.find_all("a", href=True)]
-
-        # 标题链接：href 含 /torrent/ 且 title 为 "Details for ..."
         title_a = next(
             (a for a in links if "/torrent/" in a["href"] and a.get("title", "").startswith("Details for")),
             None,
@@ -257,28 +242,20 @@ def parse_page(html: str, now: datetime) -> List[Dict[str, Any]]:
             title_a = next((a for a in links if "/torrent/" in a["href"]), None)
         if title_a is None:
             continue
-
         magnet = next((a["href"] for a in links if a["href"].startswith("magnet:?")), None)
         if not magnet:
             continue
-
         title = title_a.get_text(" ", strip=True) or title_a.get("title", "").replace("Details for ", "", 1).strip()
         tds = tr.find_all("td", recursive=False)
-
-        # 分类
         category = None
         cat_a = next((a for a in links if "/browse/" in a["href"]), None)
         if cat_a:
             category = cat_a.get_text(" ", strip=True) or None
-
-        # 上传者：/user/ 链接中有文字的那个（排除只有 icon 的 VIP 链接）
         uploader = None
         for a in links:
             if "/user/" in a["href"] and a.get_text(strip=True):
                 uploader = a.get_text(strip=True)
                 break
-
-        # 日期：找到第一个能被识别为 TPB 日期的 td
         published_raw, published_dt = None, None
         for td in tds:
             txt = td.get_text(" ", strip=True).replace("\xa0", " ")
@@ -286,8 +263,6 @@ def parse_page(html: str, now: datetime) -> List[Dict[str, Any]]:
             if parsed is not None:
                 published_raw, published_dt = txt, parsed
                 break
-
-        # 大小：含 KiB/MiB/GiB 等单位的 td
         size_text, size_bytes = None, None
         for td in tds:
             txt = td.get_text(" ", strip=True).replace("\xa0", " ")
@@ -296,8 +271,6 @@ def parse_page(html: str, now: datetime) -> List[Dict[str, Any]]:
                 size_text = txt
                 size_bytes = parse_size(txt)
                 break
-
-        # 做种数 / 下载数：大小列之后的两个纯数字 td
         seeders = leechers = None
         if size_text is not None:
             size_idx = next(
@@ -314,7 +287,6 @@ def parse_page(html: str, now: datetime) -> List[Dict[str, Any]]:
                         break
                 seeders = nums[0] if len(nums) > 0 else None
                 leechers = nums[1] if len(nums) > 1 else None
-
         results.append(
             {
                 "info_hash": info_hash_from_magnet(magnet),
@@ -331,29 +303,24 @@ def parse_page(html: str, now: datetime) -> List[Dict[str, Any]]:
                 "uploader": uploader,
             }
         )
-
     return results
-
 
 def passes_filters(
     item: Dict[str, Any], filters: Dict[str, Any], now: datetime
 ) -> Tuple[bool, str]:
-    """返回 (是否命中, 未命中原因)。"""
     keywords = [str(k).strip().lower() for k in (filters.get("title_contains") or []) if str(k).strip()]
     title_l = (item.get("title") or "").lower()
     for kw in keywords:
         if kw not in title_l:
             return False, f"标题不含关键字 '{kw}'"
-
     size_cfg = filters.get("size") or {}
     max_mb = size_cfg.get("max_mb")
     if max_mb is not None:
         if item.get("size_bytes") is None:
             return False, "无法解析大小"
-        limit = float(max_mb) * 1024 * 1024  # MiB -> 字节
+        limit = float(max_mb) * 1024 * 1024
         if item["size_bytes"] > limit:
             return False, f"大小 {item.get('size_text')} 超过上限 {max_mb} MiB"
-
     max_age_days = filters.get("max_age_days")
     if max_age_days is not None:
         if not item.get("published_at"):
@@ -364,9 +331,7 @@ def passes_filters(
             return False, "发布日期异常（在未来）"
         if age > timedelta(days=float(max_age_days)):
             return False, f"发布日期距今超过 {max_age_days} 天"
-
     return True, "ok"
-
 
 # ---------------------------------------------------------------------------
 # SQLite
@@ -398,7 +363,6 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             push_error    TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_torrents_push_status ON torrents(push_status);
-
         CREATE TABLE IF NOT EXISTS push_log (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             info_hash    TEXT NOT NULL,
@@ -412,9 +376,7 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     conn.commit()
     return conn
 
-
 def upsert_torrent(conn: sqlite3.Connection, item: Dict[str, Any]) -> None:
-    """新记录插入；已存在则更新种子自身信息，但保留推送状态。"""
     ts = now_iso()
     conn.execute(
         """
@@ -455,14 +417,8 @@ def upsert_torrent(conn: sqlite3.Connection, item: Dict[str, Any]) -> None:
         ),
     )
 
-
-def get_pending_push(conn: sqlite3.Connection) -> List[sqlite3.Row]:
-    """新增（pending）以及之前推送失败（failed）的种子。"""
-    return conn.execute(
-        "SELECT info_hash, title, magnet FROM torrents "
-        "WHERE push_status IN ('pending','failed') ORDER BY published_at DESC, first_seen DESC"
-    ).fetchall()
-
+def get_torrent_by_hash(conn: sqlite3.Connection, info_hash: str) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT info_hash,title,magnet FROM torrents WHERE info_hash = ?", (info_hash,)).fetchone()
 
 def record_push(
     conn: sqlite3.Connection, info_hash: str, title: str, ok: bool, detail: str
@@ -481,13 +437,10 @@ def record_push(
         (info_hash, title, ts, 1 if ok else 0, detail[:2000]),
     )
 
-
 # ---------------------------------------------------------------------------
 # qBittorrent Web UI API 客户端
 # ---------------------------------------------------------------------------
 class QBitClient:
-    """通过 qBittorrent Web UI (API v2) 提交 magnet。"""
-
     def __init__(self, cfg: Dict[str, Any]):
         self.host = str(cfg.get("host", "127.0.0.1"))
         self.port = int(cfg.get("port", 8080))
@@ -497,11 +450,9 @@ class QBitClient:
         self.timeout = float(cfg.get("timeout_seconds", 15))
         self.username = str(cfg.get("username", "admin"))
         self.password = str(cfg.get("password", ""))
-        # Web UI 对白名单 IP 免密时，不需要走 auth/login
         self.auth_bypass = bool(cfg.get("auth_bypass", False))
         self.sid: Optional[str] = None
         self._logged_in = False
-
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -512,14 +463,10 @@ class QBitClient:
 
     def login(self) -> None:
         if self.auth_bypass:
-            # 免密模式不需要登录。注意：服务端每次响应都会下发一个 SID，
-            # 但带上这个 SID 再请求反而会被判为无效会话（404），
-            # 所以这里清空 cookie，且在每次 add 前也会清空。
             self.session.cookies.clear()
             self.session.headers.pop("X-CSRF-Token", None)
             self._logged_in = True
             return
-
         resp = self.session.post(
             self.base + "/auth/login",
             data={"username": self.username, "password": self.password},
@@ -532,7 +479,6 @@ class QBitClient:
         if not sid:
             raise RuntimeError("登录成功但未获取到 SID cookie，请检查 Web UI 配置")
         self.sid = sid
-        # qBittorrent 4.3+ 的 CSRF 防护：需要把 SID 放进请求头
         self.session.headers.update({"X-CSRF-Token": sid})
         self._logged_in = True
 
@@ -542,8 +488,6 @@ class QBitClient:
 
     def _post_add(self, data: Dict[str, str]):
         if self.auth_bypass:
-            # 实测该 Web UI（v4.1.5 免密）在同一个 Session 上连续 POST 会返回 404，
-            # 每次新建会话则正常，所以这里不复用长连接会话。
             return requests.post(
                 self.base + "/torrents/add",
                 data=data,
@@ -564,154 +508,258 @@ class QBitClient:
             data["savepath"] = str(qcfg["save_path"])
         if qcfg.get("paused"):
             data["paused"] = "true"
-
         for attempt in range(2):
             self._ensure_login()
             try:
                 resp = self._post_add(data)
                 if resp.status_code == 400 and "tags" in data:
-                    # qBittorrent 4.1.x 尚不支持 tags 参数，去掉后重试
                     LOG.debug("服务端拒绝 tags 参数，去掉后重试")
                     resp = self._post_add({k: v for k, v in data.items() if k != "tags"})
             except requests.RequestException as exc:
                 raise RuntimeError(f"请求 qBittorrent 失败：{exc}") from exc
-
             if resp.status_code in (401, 403) and not self.auth_bypass:
-                # 会话过期（仅密码登录模式）：清掉重新登录再试一次
                 self.sid = None
                 self._logged_in = False
                 self.session.cookies.clear()
                 continue
-
             if resp.status_code == 200:
                 body = resp.text.strip()
                 if body == "" or "ok" in body.lower():
                     return True, "已提交给 qBittorrent"
                 raise RuntimeError(f"qBittorrent 返回：{body[:300]}")
-
             raise RuntimeError(f"HTTP {resp.status_code}：{resp.text[:300]}")
-
         raise RuntimeError("会话认证失效，重新登录后仍失败")
 
+# ---------------------------------------------------------------------------
+# GUI 窗口 PyQt6 QDialog
+# ---------------------------------------------------------------------------
+if HAVE_GUI:
+    class ManualSelectWindow(QDialog):
+        def __init__(self, hit_items, parent=None):
+            super().__init__(parent)
+            self.hit_items = hit_items
+            self.user_selected_hashes: Set[str] = set()
+            self.setWindowTitle("种子手动筛选 V2.0")
+            self.resize(1200, 600)
+
+            layout = QVBoxLayout(self)
+            self.table = QTableWidget()
+            cols = ["选择", "标题", "大小", "做种", "下载", "发布时间", "上传者", "info_hash"]
+            self.table.setColumnCount(len(cols))
+            self.table.setHorizontalHeaderLabels(cols)
+            self.table.setRowCount(len(self.hit_items))
+
+            for row_idx, item in enumerate(self.hit_items):
+                cb = QCheckBox()
+                cb.setChecked(False)
+                self.table.setCellWidget(row_idx, 0, cb)
+
+                self.table.setItem(row_idx,1, QTableWidgetItem(item.get("title","")))
+                self.table.setItem(row_idx,2, QTableWidgetItem(item.get("size_text","")))
+                self.table.setItem(row_idx,3, QTableWidgetItem(str(item.get("seeders","-"))))
+                self.table.setItem(row_idx,4, QTableWidgetItem(str(item.get("leechers","-"))))
+                self.table.setItem(row_idx,5, QTableWidgetItem(item.get("published_at","")))
+                self.table.setItem(row_idx,6, QTableWidgetItem(item.get("uploader","")))
+
+                hi = QTableWidgetItem(item.get("info_hash",""))
+                hi.setToolTip(item.get("magnet",""))
+                self.table.setItem(row_idx,7, hi)
+
+            self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            for c in range(2,8):
+                self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+            layout.addWidget(self.table)
+
+            btn_layout = QVBoxLayout()
+            self.btn_sel_all = QPushButton("全选")
+            self.btn_unsel_all = QPushButton("取消全选")
+            self.btn_confirm = QPushButton("确认勾选（返回主程序统一推送）")
+            self.btn_skip = QPushButton("本组全部不选，跳过")
+
+            self.btn_sel_all.clicked.connect(self._slot_sel_all)
+            self.btn_unsel_all.clicked.connect(self._slot_unsel_all)
+            self.btn_confirm.clicked.connect(self._slot_confirm)
+            self.btn_skip.clicked.connect(self.reject)
+
+            btn_layout.addWidget(self.btn_sel_all)
+            btn_layout.addWidget(self.btn_unsel_all)
+            btn_layout.addWidget(self.btn_confirm)
+            btn_layout.addWidget(self.btn_skip)
+            layout.addLayout(btn_layout)
+
+        def _slot_sel_all(self):
+            for r in range(self.table.rowCount()):
+                self.table.cellWidget(r,0).setChecked(True)
+
+        def _slot_unsel_all(self):
+            for r in range(self.table.rowCount()):
+                self.table.cellWidget(r,0).setChecked(False)
+
+        def _slot_confirm(self):
+            picked = set()
+            for r in range(self.table.rowCount()):
+                cb = self.table.cellWidget(r,0)
+                if cb.isChecked():
+                    picked.add(self.hit_items[r]["info_hash"])
+            self.user_selected_hashes = picked
+            self.accept()
 
 # ---------------------------------------------------------------------------
-# 主流程
+# 核心业务：抓取解析入库，区分auto/manual
 # ---------------------------------------------------------------------------
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="种子抓取 / SQLite 入库 / qBittorrent 推送")
-    parser.add_argument(
-        "--config",
-        default=str(Path(__file__).with_name("config.yaml")),
-        help="YAML 配置文件路径（默认：脚本同目录的 config.yaml）",
-    )
-    parser.add_argument("--html-file", default=None, help="从本地 HTML 文件读取（调试解析用）")
-    parser.add_argument("--dry-run", action="store_true", help="只抓取入库，不向 qBittorrent 推送")
-    return parser.parse_args(argv)
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    args = parse_args(argv)
-    config_path = Path(args.config).expanduser().resolve()
-    cfg = load_config(config_path)
-    base_dir = config_path.parent
-    setup_logging(cfg["logging"], base_dir)
-
-    LOG.info("=" * 64)
-    LOG.info("开始运行，配置文件：%s", config_path)
-
-    # 1~3) 逐个搜索项：抓取 -> 解析 -> 过滤
+def run_core(cfg: Dict[str, Any], base_dir: Path, html_override: Optional[str]) -> Tuple[Set[str], sqlite3.Connection, List[List[Dict[str,Any]]]]:
     now = datetime.now()
     html_cache: Dict[str, str] = {}
-    local_html: Optional[str] = None
-    if args.html_file:
-        html_path = Path(args.html_file).expanduser().resolve()
-        LOG.info("从本地 HTML 文件读取：%s（将用于全部搜索项）", html_path)
-        local_html = html_path.read_text(encoding="utf-8")
+    db_path = resolve_path(str(cfg["database"].get("path", "./torrents.db")), base_dir)
+    conn = init_db(db_path)
 
-    matched: List[Dict[str, Any]] = []
+    auto_hash_set: Set[str] = set()
+    manual_item_groups: List[List[Dict[str,Any]]] = []
+
     total_terms = len(cfg["search-terms"])
     for idx, term in enumerate(cfg["search-terms"], start=1):
         label = str(term.get("name") or term["url"])
-        LOG.info("--- 搜索项 %d/%d：%s ---", idx, total_terms, label)
+        run_mode = term.get("mode","auto")
+        LOG.info(f"---搜索项 {idx}/{total_terms} name={label}, mode={run_mode} ---")
 
-        if local_html is not None:
-            html = local_html
+        if html_override is not None:
+            html = html_override
         else:
-            url = str(term["url"])
+            url = term["url"]
             if url in html_cache:
-                LOG.info("复用已抓取的页面：%s", url)
                 html = html_cache[url]
             else:
                 try:
                     html = fetch_html(url, cfg["global"])
-                except Exception as exc:  # noqa: BLE001
-                    LOG.error("抓取失败，跳过该搜索项：%s", exc)
+                except Exception as exc:
+                    LOG.error(f"抓取失败跳过：{exc}")
                     continue
                 html_cache[url] = html
 
-        LOG.info("HTML 长度：%d 字符", len(html))
         items = parse_page(html, now)
-        term_matched: List[Dict[str, Any]] = []
-        for item in items:
-            ok, reason = passes_filters(item, term_filters(term), now)
+        filters = term_filters(term)
+        hit_list = []
+        for it in items:
+            ok, reason = passes_filters(it, filters, now)
             if ok:
-                term_matched.append(item)
+                hit_list.append(it)
             else:
-                LOG.debug("跳过《%s》：%s", item["title"], reason)
-        LOG.info("解析 %d 条，命中 %d 条", len(items), len(term_matched))
-        matched.extend(term_matched)
+                LOG.debug(f"跳过《{it.get('title')}》: {reason}")
+        LOG.info(f"解析{len(items)}条，命中 {len(hit_list)} 条")
 
-    LOG.info("全部搜索项共命中：%d 条", len(matched))
-
-    # 4) 入库
-    db_path = resolve_path(str(cfg["database"].get("path", "./torrents.db")), base_dir)
-    conn = init_db(db_path)
-    for item in matched:
-        upsert_torrent(conn, item)
-    conn.commit()
-    LOG.info("数据库已更新：%s", db_path)
-
-    # 5) 推送
-    qcfg = cfg["qbittorrent"]
-    if args.dry_run:
-        LOG.info("[dry-run] 跳过 qBittorrent 推送")
-    elif not qcfg.get("enabled", False):
-        LOG.info("qBittorrent 推送已在配置中禁用")
-    else:
-        pending = get_pending_push(conn)
-        LOG.info("待推送（新增或此前失败）：%d 条", len(pending))
-        if pending:
-            client = QBitClient(qcfg)
-            logged_in = False
-            try:
-                client.login()
-                logged_in = True
-                LOG.info("已登录 qBittorrent Web UI：%s", client.base)
-            except Exception as exc:  # noqa: BLE001
-                LOG.error("登录 qBittorrent 失败：%s", exc)
-                if qcfg.get("record_failures", True):
-                    for row in pending:
-                        record_push(conn, row["info_hash"], row["title"], False, f"登录失败：{exc}")
-
-            if logged_in:
-                for row in pending:
-                    try:
-                        ok, detail = client.add_magnet(row["magnet"], qcfg)
-                    except Exception as exc:  # noqa: BLE001
-                        ok, detail = False, str(exc)
-                    record_push(conn, row["info_hash"], row["title"], ok, detail)
-                    LOG.info("《%s》推送%s：%s", row["title"], "成功" if ok else "失败", detail)
+        for hit in hit_list:
+            upsert_torrent(conn, hit)
         conn.commit()
 
-    # 6) 汇总
-    stats = conn.execute(
-        "SELECT push_status, COUNT(*) AS n FROM torrents GROUP BY push_status"
-    ).fetchall()
-    LOG.info("数据库推送状态统计：%s", {r["push_status"]: r["n"] for r in stats})
-    conn.close()
-    LOG.info("运行结束")
-    return 0
+        if run_mode == "auto":
+            for hit in hit_list:
+                auto_hash_set.add(hit["info_hash"])
+        elif run_mode == "manual":
+            manual_item_groups.append(hit_list)
 
+    LOG.info(f"auto模式命中待推送：{len(auto_hash_set)} 个hash；manual组数量：{len(manual_item_groups)}")
+    return auto_hash_set, conn, manual_item_groups
+
+def push_all_collected(conn: sqlite3.Connection, hash_set: Set[str], qbit_cfg: Dict[str, Any]):
+    if not hash_set:
+        LOG.info("没有收集到待推送种子，跳过qBittorrent推送")
+        return
+    if not qbit_cfg.get("enabled", False):
+        LOG.info("qbittorrent推送在配置中关闭，跳过推送")
+        return
+    LOG.info(f"开始批量推送总共 {len(hash_set)} 个种子到qBittorrent")
+    try:
+        client = QBitClient(qbit_cfg)
+        client.login()
+    except Exception as e:
+        LOG.error(f"qBittorrent登录失败：{e}")
+        if qbit_cfg.get("record_failures", True):
+            for h in hash_set:
+                row = get_torrent_by_hash(conn, h)
+                if row:
+                    record_push(conn, row["info_hash"], row["title"], False, f"登录失败:{e}")
+        conn.commit()
+        return
+
+    success = 0
+    fail = 0
+    for info_hash in hash_set:
+        row = get_torrent_by_hash(conn, info_hash)
+        if row is None:
+            LOG.warning(f"数据库找不到hash {info_hash}，跳过")
+            continue
+        try:
+            ok, detail = client.add_magnet(row["magnet"], qbit_cfg)
+        except Exception as exc:
+            ok, detail = False, str(exc)
+        record_push(conn, row["info_hash"], row["title"], ok, detail)
+        if ok:
+            success +=1
+        else:
+            fail +=1
+        LOG.info(f"【推送】《{row['title']}》 {'成功' if ok else '失败'}：{detail}")
+    conn.commit()
+    LOG.info(f"批量推送完成：成功={success}，失败={fail}")
+
+# ---------------------------------------------------------------------------
+# CLI / GUI入口
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description=f"torrent_monitor V{SCRIPT_VERSION} 协议{REQUIRED_PROTOCOL_VERSION}")
+    parser.add_argument("--config", default=str(Path(__file__).with_name("config.yaml")), help="yaml配置路径")
+    parser.add_argument("--html-file", default=None, help="本地html调试解析")
+    parser.add_argument("--dry-run", action="store_true", help="仅抓取入库，不推送qBittorrent")
+    parser.add_argument("--gui", action="store_true", help="启用PyQt6图形界面（处理manual模式）")
+    args = parser.parse_args()
+
+    config_path = Path(args.config).expanduser().resolve()
+    cfg = load_config(config_path)
+    base_dir = config_path.parent
+    setup_logging(cfg["logging"], base_dir)
+    LOG.info("="*70)
+    LOG.info(f"torrent_monitor V{SCRIPT_VERSION} 启动；协议版本 {REQUIRED_PROTOCOL_VERSION}")
+    LOG.info(f"配置文件: {config_path}")
+
+    local_html: Optional[str] = None
+    if args.html_file:
+        hp = Path(args.html_file).expanduser().resolve()
+        local_html = hp.read_text(encoding="utf-8")
+        LOG.info(f"调试模式，读取本地html：{hp}")
+
+    auto_hash_set, conn, manual_groups = run_core(cfg, base_dir, local_html)
+
+    manual_selected: Set[str] = set()
+    if args.gui:
+        if not HAVE_GUI:
+            LOG.error("启用--gui但是没有安装PyQt6！请 pip install pyqt6")
+        else:
+            app = QApplication(sys.argv)
+            for group_items in manual_groups:
+                if len(group_items) == 0:
+                    continue
+                win = ManualSelectWindow(group_items)
+                win.setWindowModality(Qt.WindowModality.ApplicationModal)
+                win.exec()
+                manual_selected.update(win.user_selected_hashes)
+    else:
+        for g in manual_groups:
+            if len(g):
+                names = [x["title"] for x in g]
+                LOG.warning(f"CLI模式，跳过manual模式种子共{len(g)}条；开启--gui才可以人工选择。示例标题：{names[0][:60]}…")
+
+    total_to_push: Set[str] = auto_hash_set.union(manual_selected)
+    LOG.info(f"合并待推送集合：auto={len(auto_hash_set)}, manual-user-pick={len(manual_selected)} → 合计 {len(total_to_push)}")
+
+    if not args.dry_run:
+        push_all_collected(conn, total_to_push, cfg["qbittorrent"])
+    else:
+        LOG.info("[dry-run] 不执行qBittorrent推送，仅入库")
+
+    stats = conn.execute("SELECT push_status, COUNT(*) n FROM torrents GROUP BY push_status").fetchall()
+    LOG.info("数据库状态统计：%s", {r["push_status"]: r["n"] for r in stats})
+    conn.close()
+    LOG.info("运行结束。")
 
 if __name__ == "__main__":
     sys.exit(main())

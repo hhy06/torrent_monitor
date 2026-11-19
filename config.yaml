@@ -1,25 +1,19 @@
+protocol_version: "2.0"
+
 # =====================================================================
-# 种子监控 / qBittorrent 推送工具 配置文件
+# 种子监控 / qBittorrent 推送工具 V2.0
 # 所有相对路径都按"本配置文件所在目录"解析
 # =====================================================================
-
-# 全局抓取参数：对所有 search-terms 生效
 global:
-  # TPB 对默认 UA 不友好，建议保留浏览器 UA
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
   timeout_seconds: 25
-  # 抓取失败时重试次数（0 表示不重试）
   retries: 2
-  # 设为 false 可忽略系统 HTTP_PROXY/HTTPS_PROXY 环境变量（代理异常时可尝试）
   trust_env: true
 
-# 搜索项：每一项 = 一个页面 URL + 该页面适用的筛选条件
-# title_contains : 标题必须包含以下全部关键词（大小写不敏感）；[] 表示不限制标题
-# max_size_mb    : 大小上限，单位 MiB；null 表示任意大小
-# max_age_days   : 发布日期距今不超过 N 天；null 表示不限制日期
-# name           : 可选，仅用于日志区分，省略时用 URL
+# search‑terms mode: auto(自动推送) / manual(GUI人工勾选)
 search-terms:
   - name: "wsj"
+    mode: auto
     url: "https://thepiratebay10.xyz/user/surferbroadband/"
     title_contains:
       - "wall street journal"
@@ -27,48 +21,58 @@ search-terms:
     max_age_days: 7
 
   - name: "newsnight"
+    mode: auto
     url: "https://thepiratebay10.xyz/user/BigJ.0554/"
     title_contains:
       - "newsnight"
-    max_size_mb: null          # 任意大小
+    max_size_mb: null
     max_age_days: 7
 
+  - name: "nova"
+    mode: manual
+    url: "https://thepiratebay10.xyz/search/nova/1/3/200"
+    title_contains:
+      - "nova"
+    max_size_mb: null
+    max_age_days: 20
+
+  - name: "panorama"
+    mode: manual
+    url: "https://thepiratebay10.xyz/search/panorama/1/3/200"
+    title_contains:
+      - "panorama"
+    max_size_mb: null
+    max_age_days: 20
+
+  - name: "nature"
+    mode: manual
+    url: "https://thepiratebay10.xyz/search/nature/1/3/200"
+    title_contains:
+      - "nature"
+    max_size_mb: null
+    max_age_days: 20
+
 database:
-  # SQLite 数据库文件；首次运行会自动建表
   path: "./torrents.db"
 
-# ---------------------------------------------------------------------
-# qBittorrent 推送
-# 推荐方式：qBittorrent Web UI (API v2)。qbittorrent-nox 自带 Web UI，
-# 默认端口 8080，在 Settings -> Web UI 中可查看/修改端口与账号密码。
-# 本脚本只负责把 magnet 提交给 qBittorrent，不参与后续下载与文件管理。
-# ---------------------------------------------------------------------
 qbittorrent:
   enabled: true
-  host: "192.168.1.99"         # 远程 qbittorrent-nox 所在局域网 IP
+  host: "192.168.1.99"
   port: 8899
   use_https: false
-  # 该 Web UI 对当前 IP 免密：跳过 auth/login，直接调用 API（且不携带 SID cookie）
   auth_bypass: true
-  # 仅在 auth_bypass: false 时才会用到下面两项
   username: "admin"
-  password: "adminadmin"       # 请改成你自己的 Web UI 密码
-  # API 基础路径，一般无需改动
+  password: "adminadmin"
   api_base: "/api/v2"
-  # 推送时给种子分配的分类 / 标签（留空则不设置）
   category: "wsj"
   tags:
     - "auto"
     - "wsj"
-  # 保存路径（留空表示使用 qBittorrent 默认路径）
   save_path: ""
-  # 是否以暂停状态添加（false = 添加后立即开始）
   paused: false
   timeout_seconds: 15
-  # 登录失败或推送失败时，是否把失败原因写入数据库（默认写入）
   record_failures: true
 
 logging:
-  level: "INFO"                # DEBUG / INFO / WARNING / ERROR
-  # 日志文件路径；留空或 null 表示只输出到控制台
+  level: "INFO"
   file: "./torrent_monitor.log"
